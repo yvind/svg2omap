@@ -39,7 +39,8 @@ Adjacent paint layers with the same RGB color share one OMAP color. If another
 color occurs between two equal colors, they remain separate so that the color
 table still preserves the SVG drawing order.
 
-OMAP point symbols cannot faithfully represent gradients, partial transparency,
-clip paths, masks, filters, blend modes, or raster images. The converter reports
-a clear error when visible artwork uses one of these features instead of silently
-producing a different-looking symbol.
+OMAP point symbols cannot faithfully represent every SVG feature.
+The converter prints warnings when it makes these fallbacks:
+gradients become their average color, partial transparency becomes fully opaque,
+and clip paths, masks, filters, and blend modes are ignored.
+Pattern paints and raster images are skipped.

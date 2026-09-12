@@ -55,6 +55,8 @@ pub struct Conversion {
     pub paint_layers: usize,
     /// Number of area elements created inside the point symbol.
     pub area_elements: usize,
+    /// Non-fatal SVG features that were approximated or skipped.
+    pub warnings: Vec<String>,
 }
 
 /// A conversion failure with a user-facing explanation.
@@ -94,8 +96,9 @@ struct PaintLayer {
 ///
 /// SVG shapes, transforms, CSS, primitive elements, strokes, dashes and text
 /// outlines are resolved by `usvg`. OMAP has no direct equivalent for
-/// gradients, transparency, clipping, masks, filters, blending, or raster
-/// images, so visible uses of those features return a descriptive error.
+/// gradients, transparency, clipping, masks, filters, blending, patterns, or
+/// raster images. Unsupported effects are approximated or skipped and reported
+/// in [`Conversion::warnings`].
 pub fn convert_svg(
     svg_data: &[u8],
     resource_directory: Option<&Path>,
@@ -125,13 +128,9 @@ pub fn convert_svg(
     };
 
     let mut layers = Vec::new();
-    collect_group(tree.root(), 1.0, coordinates, &mut layers)?;
+    let mut warnings = Vec::new();
+    collect_group(tree.root(), coordinates, &mut layers, &mut warnings)?;
     let layers = merge_adjacent_layers(layers);
-    if layers.is_empty() {
-        return Err(ConversionError::new(
-            "the SVG contains no visible, solid-color vector artwork",
-        ));
-    }
 
     let mut map = Omap::new(options.map_scale);
     let mut point_symbol = PointSymbol::new(options.symbol_code, &options.symbol_name);
@@ -180,6 +179,7 @@ pub fn convert_svg(
         height_mm: viewport_height_px * mm_per_px,
         paint_layers: layers.len(),
         area_elements,
+        warnings,
     })
 }
 
@@ -217,52 +217,59 @@ fn validate_options(options: &ConversionOptions) -> Result<()> {
 
 fn collect_group(
     group: &usvg::Group,
-    inherited_opacity: f64,
     coordinates: CoordinateSystem,
     layers: &mut Vec<PaintLayer>,
+    warnings: &mut Vec<String>,
 ) -> Result<()> {
-    let opacity = inherited_opacity * f64::from(group.opacity().get());
+    let opacity = f64::from(group.opacity().get());
     if opacity <= OPACITY_EPSILON {
         return Ok(());
     }
-    require_opaque(opacity, "group")?;
+    warn_if_transparent(opacity, "an SVG group", warnings);
 
     if group.blend_mode() != BlendMode::Normal {
-        return Err(ConversionError::new(format!(
-            "unsupported SVG blend mode {:?}; OMAP point symbols only support normal opaque paint",
-            group.blend_mode()
-        )));
+        push_warning(
+            warnings,
+            format!(
+                "SVG blend mode {:?} was ignored and rendered as normal paint",
+                group.blend_mode()
+            ),
+        );
     }
     if group.clip_path().is_some() {
-        return Err(ConversionError::new(
-            "SVG clip paths cannot be represented by an OMAP point symbol",
-        ));
+        push_warning(
+            warnings,
+            "an SVG clip path was ignored; its artwork was converted unclipped",
+        );
     }
     if group.mask().is_some() {
-        return Err(ConversionError::new(
-            "SVG masks cannot be represented by an OMAP point symbol",
-        ));
+        push_warning(
+            warnings,
+            "an SVG mask was ignored; its artwork was converted unmasked",
+        );
     }
     if !group.filters().is_empty() {
-        return Err(ConversionError::new(
-            "SVG filters cannot be represented by an OMAP point symbol",
-        ));
+        push_warning(
+            warnings,
+            "one or more SVG filters were ignored while converting their artwork",
+        );
     }
 
     for node in group.children() {
         match node {
-            Node::Group(child) => collect_group(child, opacity, coordinates, layers)?,
+            Node::Group(child) => collect_group(child, coordinates, layers, warnings)?,
             Node::Path(path) if path.is_visible() => {
-                collect_path(path, opacity, coordinates, layers)?;
+                collect_path(path, coordinates, layers, warnings)?;
             }
             Node::Path(_) => {}
             Node::Text(text) => {
-                collect_group(text.flattened(), opacity, coordinates, layers)?;
+                collect_group(text.flattened(), coordinates, layers, warnings)?;
             }
             Node::Image(_) => {
-                return Err(ConversionError::new(
-                    "raster or embedded SVG images are not supported; convert the image to paths first",
-                ));
+                push_warning(
+                    warnings,
+                    "a raster or embedded SVG image was skipped; convert it to paths to include it",
+                );
             }
         }
     }
@@ -271,78 +278,95 @@ fn collect_group(
 
 fn collect_path(
     path: &usvg::Path,
-    inherited_opacity: f64,
     coordinates: CoordinateSystem,
     layers: &mut Vec<PaintLayer>,
+    warnings: &mut Vec<String>,
 ) -> Result<()> {
-    let fill = || -> Result<Option<PaintLayer>> {
-        let Some(fill) = path.fill() else {
-            return Ok(None);
-        };
-        let opacity = inherited_opacity * f64::from(fill.opacity().get());
-        if opacity <= OPACITY_EPSILON {
-            return Ok(None);
-        }
-        require_opaque(opacity, path_description(path))?;
-        let color = solid_color(fill.paint(), path_description(path))?;
-        let polygons =
-            path_to_polygons(path.data(), path.abs_transform(), coordinates, fill.rule())?;
-        Ok((!polygons.is_empty()).then_some(PaintLayer { color, polygons }))
-    };
-
-    let stroke = || -> Result<Option<PaintLayer>> {
-        let Some(stroke) = path.stroke() else {
-            return Ok(None);
-        };
-        let opacity = inherited_opacity * f64::from(stroke.opacity().get());
-        if opacity <= OPACITY_EPSILON {
-            return Ok(None);
-        }
-        require_opaque(opacity, path_description(path))?;
-        let color = solid_color(stroke.paint(), path_description(path))?;
-        let resolution_scale = path
-            .abs_transform()
-            .get_scale()
-            .0
-            .max(path.abs_transform().get_scale().1)
-            .max(1.0);
-        let mut stroke_style = stroke.to_tiny_skia();
-        let dashed_path = stroke_style
-            .dash
-            .take()
-            .map(|dash| {
-                path.data().dash(&dash, resolution_scale).ok_or_else(|| {
-                    ConversionError::new(format!(
-                        "could not apply the dash pattern of {}",
-                        path_description(path)
-                    ))
-                })
-            })
-            .transpose()?;
-        let stroke_source = dashed_path.as_ref().unwrap_or_else(|| path.data());
-        let outline = stroke_source
-            .stroke(&stroke_style, resolution_scale)
-            .ok_or_else(|| {
-                ConversionError::new(format!(
-                    "could not expand the stroke of {} into an outline",
-                    path_description(path)
-                ))
-            })?;
-        let polygons = path_to_polygons(
-            &outline,
-            path.abs_transform(),
-            coordinates,
-            FillRule::NonZero,
-        )?;
-        Ok((!polygons.is_empty()).then_some(PaintLayer { color, polygons }))
-    };
-
     let operations = match path.paint_order() {
-        PaintOrder::FillAndStroke => [fill()?, stroke()?],
-        PaintOrder::StrokeAndFill => [stroke()?, fill()?],
+        PaintOrder::FillAndStroke => [
+            fill_layer(path, coordinates, warnings)?,
+            stroke_layer(path, coordinates, warnings)?,
+        ],
+        PaintOrder::StrokeAndFill => [
+            stroke_layer(path, coordinates, warnings)?,
+            fill_layer(path, coordinates, warnings)?,
+        ],
     };
     layers.extend(operations.into_iter().flatten());
     Ok(())
+}
+
+fn fill_layer(
+    path: &usvg::Path,
+    coordinates: CoordinateSystem,
+    warnings: &mut Vec<String>,
+) -> Result<Option<PaintLayer>> {
+    let Some(fill) = path.fill() else {
+        return Ok(None);
+    };
+    let opacity = f64::from(fill.opacity().get());
+    if opacity <= OPACITY_EPSILON {
+        return Ok(None);
+    }
+    warn_if_transparent(opacity, path_description(path), warnings);
+    let Some(color) = paint_color(fill.paint(), path_description(path), warnings) else {
+        return Ok(None);
+    };
+    let polygons = path_to_polygons(path.data(), path.abs_transform(), coordinates, fill.rule())?;
+    Ok((!polygons.is_empty()).then_some(PaintLayer { color, polygons }))
+}
+
+fn stroke_layer(
+    path: &usvg::Path,
+    coordinates: CoordinateSystem,
+    warnings: &mut Vec<String>,
+) -> Result<Option<PaintLayer>> {
+    let Some(stroke) = path.stroke() else {
+        return Ok(None);
+    };
+    let opacity = f64::from(stroke.opacity().get());
+    if opacity <= OPACITY_EPSILON {
+        return Ok(None);
+    }
+    warn_if_transparent(opacity, path_description(path), warnings);
+    let Some(color) = paint_color(stroke.paint(), path_description(path), warnings) else {
+        return Ok(None);
+    };
+    let resolution_scale = path
+        .abs_transform()
+        .get_scale()
+        .0
+        .max(path.abs_transform().get_scale().1)
+        .max(1.0);
+    let mut stroke_style = stroke.to_tiny_skia();
+    let dashed_path = stroke_style
+        .dash
+        .take()
+        .map(|dash| {
+            path.data().dash(&dash, resolution_scale).ok_or_else(|| {
+                ConversionError::new(format!(
+                    "could not apply the dash pattern of {}",
+                    path_description(path)
+                ))
+            })
+        })
+        .transpose()?;
+    let stroke_source = dashed_path.as_ref().unwrap_or_else(|| path.data());
+    let outline = stroke_source
+        .stroke(&stroke_style, resolution_scale)
+        .ok_or_else(|| {
+            ConversionError::new(format!(
+                "could not expand the stroke of {} into an outline",
+                path_description(path)
+            ))
+        })?;
+    let polygons = path_to_polygons(
+        &outline,
+        path.abs_transform(),
+        coordinates,
+        FillRule::NonZero,
+    )?;
+    Ok((!polygons.is_empty()).then_some(PaintLayer { color, polygons }))
 }
 
 fn path_description(path: &usvg::Path) -> &str {
@@ -353,28 +377,109 @@ fn path_description(path: &usvg::Path) -> &str {
     }
 }
 
-fn require_opaque(opacity: f64, description: &str) -> Result<()> {
-    if (opacity - 1.0).abs() <= OPACITY_EPSILON {
-        Ok(())
-    } else {
-        Err(ConversionError::new(format!(
-            "{description} uses opacity {opacity:.3}; OMAP point symbols do not support transparency"
-        )))
+fn warn_if_transparent(opacity: f64, description: &str, warnings: &mut Vec<String>) {
+    if (opacity - 1.0).abs() > OPACITY_EPSILON {
+        push_warning(
+            warnings,
+            format!("{description} uses opacity {opacity:.3}; it was made fully opaque"),
+        );
     }
 }
 
-fn solid_color(paint: &Paint, description: &str) -> Result<usvg::Color> {
+fn paint_color(
+    paint: &Paint,
+    description: &str,
+    warnings: &mut Vec<String>,
+) -> Option<usvg::Color> {
     match paint {
-        Paint::Color(color) => Ok(*color),
-        Paint::LinearGradient(_) => Err(ConversionError::new(format!(
-            "{description} uses a linear gradient; OMAP point symbols only support solid colors"
-        ))),
-        Paint::RadialGradient(_) => Err(ConversionError::new(format!(
-            "{description} uses a radial gradient; OMAP point symbols only support solid colors"
-        ))),
-        Paint::Pattern(_) => Err(ConversionError::new(format!(
-            "{description} uses an SVG paint pattern; convert it to solid paths first"
-        ))),
+        Paint::Color(color) => Some(*color),
+        Paint::LinearGradient(gradient) => {
+            let color = average_gradient_color(gradient.stops());
+            push_warning(
+                warnings,
+                format!(
+                    "{description} uses a linear gradient; it was replaced with {}",
+                    color_hex(color)
+                ),
+            );
+            warn_for_transparent_stops(gradient.stops(), description, warnings);
+            Some(color)
+        }
+        Paint::RadialGradient(gradient) => {
+            let color = average_gradient_color(gradient.stops());
+            push_warning(
+                warnings,
+                format!(
+                    "{description} uses a radial gradient; it was replaced with {}",
+                    color_hex(color)
+                ),
+            );
+            warn_for_transparent_stops(gradient.stops(), description, warnings);
+            Some(color)
+        }
+        Paint::Pattern(_) => {
+            push_warning(
+                warnings,
+                format!("{description} uses an SVG paint pattern; that paint was skipped"),
+            );
+            None
+        }
+    }
+}
+
+fn warn_for_transparent_stops(stops: &[usvg::Stop], description: &str, warnings: &mut Vec<String>) {
+    if stops
+        .iter()
+        .any(|stop| stop.opacity().get() < 1.0 - OPACITY_EPSILON as f32)
+    {
+        push_warning(
+            warnings,
+            format!("{description} has transparent gradient stops; they were made fully opaque"),
+        );
+    }
+}
+
+fn average_gradient_color(stops: &[usvg::Stop]) -> usvg::Color {
+    let Some(first) = stops.first() else {
+        return usvg::Color::black();
+    };
+
+    let mut red = f64::from(first.color().red) * f64::from(first.offset().get());
+    let mut green = f64::from(first.color().green) * f64::from(first.offset().get());
+    let mut blue = f64::from(first.color().blue) * f64::from(first.offset().get());
+
+    for pair in stops.windows(2) {
+        let left = pair[0];
+        let right = pair[1];
+        let width = f64::from(right.offset().get() - left.offset().get());
+        red += width * f64::from(u16::from(left.color().red) + u16::from(right.color().red)) / 2.0;
+        green +=
+            width * f64::from(u16::from(left.color().green) + u16::from(right.color().green)) / 2.0;
+        blue +=
+            width * f64::from(u16::from(left.color().blue) + u16::from(right.color().blue)) / 2.0;
+    }
+
+    let last = stops.last().expect("a first stop implies a last stop");
+    let remaining = 1.0 - f64::from(last.offset().get());
+    red += f64::from(last.color().red) * remaining;
+    green += f64::from(last.color().green) * remaining;
+    blue += f64::from(last.color().blue) * remaining;
+
+    usvg::Color::new_rgb(
+        red.round().clamp(0.0, 255.0) as u8,
+        green.round().clamp(0.0, 255.0) as u8,
+        blue.round().clamp(0.0, 255.0) as u8,
+    )
+}
+
+fn color_hex(color: usvg::Color) -> String {
+    format!("#{:02x}{:02x}{:02x}", color.red, color.green, color.blue)
+}
+
+fn push_warning(warnings: &mut Vec<String>, warning: impl Into<String>) {
+    let warning = warning.into();
+    if !warnings.contains(&warning) {
+        warnings.push(warning);
     }
 }
 

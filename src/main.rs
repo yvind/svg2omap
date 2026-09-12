@@ -75,6 +75,9 @@ fn run(cli: Cli) -> Result<(), String> {
         .unwrap_or_else(|| default_output_path(&cli.input));
     let conversion =
         convert_svg(&data, cli.input.parent(), &options).map_err(|error| error.to_string())?;
+    for warning in &conversion.warnings {
+        eprintln!("warning: {warning}");
+    }
     conversion
         .map
         .to_file(&output)
