@@ -8,7 +8,7 @@ use std::{
 
 use clap::{Parser, ValueHint};
 use omap::Code;
-use svg_to_omap_point_symbol::{ConversionOptions, convert_svg};
+use svg2omap::{ConversionOptions, convert_svg};
 
 #[derive(Debug, Parser)]
 #[command(

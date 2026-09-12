@@ -6,7 +6,7 @@ This command converts SVG vector artwork into one point symbol in an otherwise e
 
 ```sh
 cargo build --release
-./target/release/svg_to_omap_point_symbol input.svg output.omap
+./target/release/svg2omap input.svg output.omap
 ```
 or
 ```sh
@@ -16,7 +16,7 @@ cargo run --release input.svg output.omap
 The output path is optional; without it, `input.svg` becomes `input.omap`.
 
 ```text
-svg_to_omap_point_symbol [OPTIONS] <INPUT.svg> [OUTPUT.omap]
+svg2omap [OPTIONS] <INPUT.svg> [OUTPUT.omap]
 
 --name <NAME>        Point-symbol name (default: input file name)
 --code <A[.B[.C]]>   Point-symbol code (default: 900)
