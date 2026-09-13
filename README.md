@@ -31,7 +31,10 @@ Physical SVG units such as `mm` retain their intended size.
 
 The converter resolves CSS, transforms, path commands, primitive shapes, dashed strokes, line caps/joins, and text outlines.
 It centers the SVG viewport at the point-symbol origin.
-Strokes are expanded into filled outlines so their SVG appearance is retained.
+Compatible SVG strokes become native OMAP line elements, including their widths, dash patterns, caps, and joins.
+Strokes are expanded into filled outlines when SVG features or transforms cannot be represented by an OMAP line without changing their appearance.
+Native line conversion supports solid strokes and OMAP-compatible repeating dash groups with no dash offset.
+Non-uniform scaling or skew, SVG miter options without an OMAP equivalent, and other dash patterns retain their appearance as filled outlines.
 
 Adjacent paint layers with the same RGB color share one OMAP color.
 If another color occurs between two equal colors, they remain separate so that the color table still preserves the SVG drawing order.

@@ -84,11 +84,13 @@ fn run(cli: Cli) -> Result<(), String> {
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
 
     println!(
-        "Wrote {}: {:.3} x {:.3} mm, {} paint layers, {} point-symbol elements",
+        "Wrote {}: {:.3} x {:.3} mm, {} paint layers, {} point-symbol elements ({} lines, {} areas)",
         output.display(),
         conversion.width_mm,
         conversion.height_mm,
         conversion.paint_layers,
+        conversion.line_elements + conversion.area_elements,
+        conversion.line_elements,
         conversion.area_elements,
     );
     Ok(())

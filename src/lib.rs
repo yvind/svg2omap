@@ -4,15 +4,19 @@ use omap::{
     Code, NonNegativeF64, Omap,
     colors::{Cmyk, Rgb, SpotColor, SymbolColor},
     geo_types::Coord,
-    objects::{AreaObject, BezierPath, BezierPolygon, BezierSegment, BezierString},
-    symbols::{AreaSymbol, Element, PointSymbol},
+    objects::{AreaObject, BezierPath, BezierPolygon, BezierSegment, BezierString, LineObject},
+    symbols::{
+        AreaSymbol, CapStyle, DashStyle, Element, GroupDashes, JoinStyle, LineSymbol, PointSymbol,
+    },
 };
-use usvg::{BlendMode, FillRule, Node, Paint, PaintOrder};
+use usvg::{BlendMode, FillRule, LineCap, LineJoin, Node, Paint, PaintOrder};
 
 const MM_PER_INCH: f64 = 25.4;
 const DEFAULT_DPI: f64 = 96.0;
 const TOPOLOGY_FLATTENING_TOLERANCE_MM: f64 = 0.0025;
 const OPACITY_EPSILON: f64 = 1.0e-6;
+const TRANSFORM_EPSILON: f64 = 1.0e-5;
+const SVG_DEFAULT_MITER_LIMIT: f32 = 4.0;
 
 /// Options controlling SVG parsing and OMAP creation.
 #[derive(Debug, Clone)]
@@ -55,6 +59,8 @@ pub struct Conversion {
     pub paint_layers: usize,
     /// Number of area elements created inside the point symbol.
     pub area_elements: usize,
+    /// Number of native line elements created inside the point symbol.
+    pub line_elements: usize,
     /// Non-fatal SVG features that were approximated or skipped.
     pub warnings: Vec<String>,
 }
@@ -89,7 +95,22 @@ struct CoordinateSystem {
 #[derive(Debug)]
 struct PaintLayer {
     color: usvg::Color,
-    polygons: Vec<BezierPolygon>,
+    elements: Vec<PaintElement>,
+}
+
+#[derive(Debug)]
+enum PaintElement {
+    Area(BezierPolygon),
+    Line(LinePaint),
+}
+
+#[derive(Debug)]
+struct LinePaint {
+    path: BezierPath,
+    width_mm: f64,
+    cap_style: CapStyle,
+    join_style: JoinStyle,
+    dash_style: DashStyle,
 }
 
 /// Convert SVG bytes into an empty map containing a single point symbol.
@@ -135,6 +156,7 @@ pub fn convert_svg(
     let mut map = Omap::new(options.map_scale);
     let mut point_symbol = PointSymbol::new(options.symbol_code, &options.symbol_name);
     let mut area_elements = 0;
+    let mut line_elements = 0;
 
     // New SVG paint operations cover older ones. Inserting each new color at
     // priority zero gives it the corresponding higher OMAP drawing priority.
@@ -158,14 +180,31 @@ pub fn convert_svg(
             .insert(0, color)
             .map_err(|error| ConversionError::new(format!("could not add OMAP color: {error}")))?;
 
-        for polygon in &layer.polygons {
-            let area_symbol =
-                AreaSymbol::new(Code::default(), "").with_color(SymbolColor::Color(color_id));
-            point_symbol.elements.push(Element::Area {
-                symbol: Box::new(area_symbol),
-                object: Box::new(AreaObject::new_element(polygon.clone())),
-            });
-            area_elements += 1;
+        for element in &layer.elements {
+            match element {
+                PaintElement::Area(polygon) => {
+                    let area_symbol = AreaSymbol::new(Code::default(), "")
+                        .with_color(SymbolColor::Color(color_id));
+                    point_symbol.elements.push(Element::Area {
+                        symbol: Box::new(area_symbol),
+                        object: Box::new(AreaObject::new_element(polygon.clone())),
+                    });
+                    area_elements += 1;
+                }
+                PaintElement::Line(line) => {
+                    let line_symbol = LineSymbol::new(Code::default(), "")
+                        .with_color(SymbolColor::Color(color_id))
+                        .with_line_width(NonNegativeF64::clamped_from(line.width_mm))
+                        .with_cap_style(line.cap_style)
+                        .with_join_style(line.join_style)
+                        .with_dash_style(line.dash_style.clone());
+                    point_symbol.elements.push(Element::Line {
+                        symbol: Box::new(line_symbol),
+                        object: Box::new(LineObject::new_element(line.path.clone())),
+                    });
+                    line_elements += 1;
+                }
+            }
         }
     }
 
@@ -179,6 +218,7 @@ pub fn convert_svg(
         height_mm: viewport_height_px * mm_per_px,
         paint_layers: layers.len(),
         area_elements,
+        line_elements,
         warnings,
     })
 }
@@ -189,7 +229,7 @@ fn merge_adjacent_layers(layers: Vec<PaintLayer>) -> Vec<PaintLayer> {
         if let Some(previous) = merged.last_mut()
             && previous.color == layer.color
         {
-            previous.polygons.append(&mut layer.polygons);
+            previous.elements.append(&mut layer.elements);
         } else {
             merged.push(layer);
         }
@@ -313,7 +353,11 @@ fn fill_layer(
         return Ok(None);
     };
     let polygons = path_to_polygons(path.data(), path.abs_transform(), coordinates, fill.rule())?;
-    Ok((!polygons.is_empty()).then_some(PaintLayer { color, polygons }))
+    let elements = polygons
+        .into_iter()
+        .map(PaintElement::Area)
+        .collect::<Vec<_>>();
+    Ok((!elements.is_empty()).then_some(PaintLayer { color, elements }))
 }
 
 fn stroke_layer(
@@ -332,6 +376,27 @@ fn stroke_layer(
     let Some(color) = paint_color(stroke.paint(), path_description(path), warnings) else {
         return Ok(None);
     };
+
+    if let Some(style) = native_line_style(stroke, path.abs_transform(), coordinates)
+        && let Some(paths) = path_to_lines(path.data(), path.abs_transform(), coordinates)?
+    {
+        let elements = paths
+            .into_iter()
+            .map(|path| {
+                PaintElement::Line(LinePaint {
+                    path,
+                    width_mm: style.width_mm,
+                    cap_style: style.cap_style,
+                    join_style: style.join_style,
+                    dash_style: style.dash_style.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        if !elements.is_empty() {
+            return Ok(Some(PaintLayer { color, elements }));
+        }
+    }
+
     let resolution_scale = path
         .abs_transform()
         .get_scale()
@@ -366,7 +431,130 @@ fn stroke_layer(
         coordinates,
         FillRule::NonZero,
     )?;
-    Ok((!polygons.is_empty()).then_some(PaintLayer { color, polygons }))
+    let elements = polygons
+        .into_iter()
+        .map(PaintElement::Area)
+        .collect::<Vec<_>>();
+    Ok((!elements.is_empty()).then_some(PaintLayer { color, elements }))
+}
+
+#[derive(Debug)]
+struct NativeLineStyle {
+    width_mm: f64,
+    cap_style: CapStyle,
+    join_style: JoinStyle,
+    dash_style: DashStyle,
+}
+
+fn native_line_style(
+    stroke: &usvg::Stroke,
+    transform: usvg::Transform,
+    coordinates: CoordinateSystem,
+) -> Option<NativeLineStyle> {
+    let transform_scale = similarity_scale(transform)?;
+    let length_scale = transform_scale * coordinates.mm_per_px;
+
+    let cap_style = match stroke.linecap() {
+        LineCap::Butt => CapStyle::Flat,
+        LineCap::Round => CapStyle::Round,
+        LineCap::Square => CapStyle::Square,
+    };
+    let join_style = match stroke.linejoin() {
+        LineJoin::Miter
+            if (stroke.miterlimit().get() - SVG_DEFAULT_MITER_LIMIT).abs()
+                <= f32::EPSILON * SVG_DEFAULT_MITER_LIMIT =>
+        {
+            JoinStyle::Miter
+        }
+        LineJoin::Miter => return None,
+        LineJoin::MiterClip => return None,
+        LineJoin::Round => JoinStyle::Round,
+        LineJoin::Bevel => JoinStyle::Bevel,
+    };
+    let dash_style = native_dash_style(stroke, length_scale)?;
+
+    Some(NativeLineStyle {
+        width_mm: f64::from(stroke.width().get()) * length_scale,
+        cap_style,
+        join_style,
+        dash_style,
+    })
+}
+
+fn similarity_scale(transform: usvg::Transform) -> Option<f64> {
+    let sx = f64::from(transform.sx);
+    let kx = f64::from(transform.kx);
+    let ky = f64::from(transform.ky);
+    let sy = f64::from(transform.sy);
+    let first_length_squared = sx * sx + ky * ky;
+    let second_length_squared = kx * kx + sy * sy;
+    let scale_squared = (first_length_squared + second_length_squared) / 2.0;
+    if !scale_squared.is_finite() || scale_squared <= f64::EPSILON {
+        return None;
+    }
+
+    let orthogonality_error = (sx * kx + ky * sy).abs();
+    let scale_error = (first_length_squared - second_length_squared).abs();
+    if orthogonality_error > TRANSFORM_EPSILON * scale_squared
+        || scale_error > TRANSFORM_EPSILON * scale_squared
+    {
+        return None;
+    }
+    Some(scale_squared.sqrt())
+}
+
+fn native_dash_style(stroke: &usvg::Stroke, length_scale: f64) -> Option<DashStyle> {
+    let Some(dashes) = stroke.dasharray() else {
+        return Some(DashStyle::default());
+    };
+    if stroke.dashoffset().abs() > f32::EPSILON || dashes.len() < 2 || dashes.len() % 2 != 0 {
+        return None;
+    }
+
+    let dash_count = dashes.len() / 2;
+    if dash_count > 4 {
+        return None;
+    }
+    let dash_length = dashes[0];
+    if !dashes
+        .iter()
+        .step_by(2)
+        .all(|length| approximately_equal(*length, dash_length))
+    {
+        return None;
+    }
+
+    let outer_break_length = dashes[dashes.len() - 1];
+    let dash_group = if dash_count == 1 {
+        GroupDashes::UnGrouped {
+            half_outer_dashes: false,
+        }
+    } else {
+        let inner_break_length = dashes[1];
+        if !dashes[1..dashes.len() - 1]
+            .iter()
+            .step_by(2)
+            .all(|length| approximately_equal(*length, inner_break_length))
+        {
+            return None;
+        }
+        GroupDashes::Grouped {
+            dashes_in_group: dash_count as u8,
+            in_group_break_length: NonNegativeF64::clamped_from(
+                f64::from(inner_break_length) * length_scale,
+            ),
+        }
+    };
+
+    Some(DashStyle::Dashed {
+        dash_length: NonNegativeF64::clamped_from(f64::from(dash_length) * length_scale),
+        break_length: NonNegativeF64::clamped_from(f64::from(outer_break_length) * length_scale),
+        dash_group,
+    })
+}
+
+fn approximately_equal(left: f32, right: f32) -> bool {
+    (left - right).abs() <= f32::EPSILON * left.abs().max(right.abs()).max(1.0)
 }
 
 fn path_description(path: &usvg::Path) -> &str {
@@ -489,7 +677,8 @@ fn path_to_polygons(
     coordinates: CoordinateSystem,
     fill_rule: FillRule,
 ) -> Result<Vec<BezierPolygon>> {
-    let paths = split_contours(path, transform, coordinates)?;
+    let paths = split_paths(path, transform, coordinates, PathPurpose::Fill)?
+        .expect("fill conversion cannot reject an implicitly closed contour");
     if paths.is_empty() {
         return Ok(Vec::new());
     }
@@ -659,11 +848,26 @@ fn point_in_polygon(point: Coord, polygon: &[Coord]) -> bool {
     inside
 }
 
-fn split_contours(
+fn path_to_lines(
     path: &usvg::tiny_skia_path::Path,
     transform: usvg::Transform,
     coordinates: CoordinateSystem,
-) -> Result<Vec<BezierPath>> {
+) -> Result<Option<Vec<BezierPath>>> {
+    split_paths(path, transform, coordinates, PathPurpose::Line)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PathPurpose {
+    Fill,
+    Line,
+}
+
+fn split_paths(
+    path: &usvg::tiny_skia_path::Path,
+    transform: usvg::Transform,
+    coordinates: CoordinateSystem,
+    purpose: PathPurpose,
+) -> Result<Option<Vec<BezierPath>>> {
     let mut contours = Vec::new();
     let mut segments = Vec::new();
     let mut start = None;
@@ -673,7 +877,9 @@ fn split_contours(
         use usvg::tiny_skia_path::PathSegment;
         match command {
             PathSegment::MoveTo(point) => {
-                finish_contour(&mut contours, &mut segments, start, current)?;
+                if !finish_contour(&mut contours, &mut segments, start, current, purpose, false)? {
+                    return Ok(None);
+                }
                 let point = convert_point(point, transform, coordinates);
                 start = Some(point);
                 current = Some(point);
@@ -707,14 +913,16 @@ fn split_contours(
                 append_segment(&mut segments, &mut start, &mut current, Some(handles), end)?;
             }
             PathSegment::Close => {
-                finish_contour(&mut contours, &mut segments, start, current)?;
+                finish_contour(&mut contours, &mut segments, start, current, purpose, true)?;
                 current = start;
                 start = None;
             }
         }
     }
-    finish_contour(&mut contours, &mut segments, start, current)?;
-    Ok(contours)
+    if !finish_contour(&mut contours, &mut segments, start, current, purpose, false)? {
+        return Ok(None);
+    }
+    Ok(Some(contours))
 }
 
 fn append_segment(
@@ -739,13 +947,22 @@ fn finish_contour(
     segments: &mut Vec<BezierSegment>,
     start: Option<Coord>,
     current: Option<Coord>,
-) -> Result<()> {
+    purpose: PathPurpose,
+    explicitly_closed: bool,
+) -> Result<bool> {
     if segments.is_empty() {
-        return Ok(());
+        return Ok(true);
     }
     let start = start.ok_or_else(|| ConversionError::new("SVG contour has no start point"))?;
     let current = current.ok_or_else(|| ConversionError::new("SVG contour has no end point"))?;
-    if current != start {
+
+    // OMAP infers closure from equal endpoint coordinates. It cannot encode an
+    // open SVG subpath which happens to return to its start, where caps rather
+    // than a join must be rendered, so keep that uncommon case as an outline.
+    if purpose == PathPurpose::Line && !explicitly_closed && current == start {
+        return Ok(false);
+    }
+    if (purpose == PathPurpose::Fill || explicitly_closed) && current != start {
         segments.push(BezierSegment::new(current, None, start));
     }
     let segment_count = segments.len();
@@ -755,7 +972,7 @@ fn finish_contour(
     )
     .map_err(|error| ConversionError::new(format!("invalid converted SVG contour: {error}")))?;
     contours.push(path);
-    Ok(())
+    Ok(true)
 }
 
 fn convert_point(
@@ -767,5 +984,159 @@ fn convert_point(
     Coord {
         x: (f64::from(point.x) - coordinates.center_x_px) * coordinates.mm_per_px,
         y: (coordinates.center_y_px - f64::from(point.y)) * coordinates.mm_per_px,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn convert(svg: &str) -> Conversion {
+        convert_svg(svg.as_bytes(), None, &ConversionOptions::new("test symbol"))
+            .expect("test SVG should convert")
+    }
+
+    fn point_symbol(conversion: &Conversion) -> &PointSymbol {
+        conversion
+            .map
+            .symbols
+            .iter_point_symbols()
+            .next()
+            .expect("conversion should create a point symbol")
+            .1
+    }
+
+    #[test]
+    fn solid_stroke_becomes_a_native_line() {
+        let conversion = convert(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+                <path d="M 2 5 L 10 5 L 18 10" fill="none" stroke="#123456"
+                      stroke-width="2" stroke-linecap="square" stroke-linejoin="round"/>
+            </svg>"##,
+        );
+
+        assert_eq!(conversion.line_elements, 1);
+        assert_eq!(conversion.area_elements, 0);
+        let Element::Line { symbol, object } = &point_symbol(&conversion).elements[0] else {
+            panic!("stroke should be stored as a line element");
+        };
+        assert!((symbol.line_width.get() - 2.0 * MM_PER_INCH / DEFAULT_DPI).abs() < 1.0e-9);
+        assert!(matches!(symbol.cap_style, CapStyle::Square));
+        assert!(matches!(symbol.join_style, JoinStyle::Round));
+        assert_eq!(object.geometry().num_segments(), 2);
+        assert!(!object.geometry().is_closed());
+    }
+
+    #[test]
+    fn compatible_grouped_dashes_become_a_native_line() {
+        let conversion = convert(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 10">
+                <path d="M 1 5 H 39" fill="none" stroke="black" stroke-width="1"
+                      stroke-linecap="round" stroke-dasharray="4 2 4 6"/>
+            </svg>"#,
+        );
+
+        assert_eq!(conversion.line_elements, 1);
+        assert_eq!(conversion.area_elements, 0);
+        let Element::Line { symbol, .. } = &point_symbol(&conversion).elements[0] else {
+            panic!("compatible dashes should be stored as a line element");
+        };
+        let DashStyle::Dashed {
+            dash_length,
+            break_length,
+            dash_group,
+        } = &symbol.dash_style
+        else {
+            panic!("the line should be dashed");
+        };
+        let scale = MM_PER_INCH / DEFAULT_DPI;
+        assert!((dash_length.get() - 4.0 * scale).abs() < 1.0e-9);
+        assert!((break_length.get() - 6.0 * scale).abs() < 1.0e-9);
+        let GroupDashes::Grouped {
+            dashes_in_group,
+            in_group_break_length,
+        } = dash_group
+        else {
+            panic!("the SVG dash cycle should become an OMAP dash group");
+        };
+        assert_eq!(*dashes_in_group, 2);
+        assert!((in_group_break_length.get() - 2.0 * scale).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn non_uniformly_transformed_stroke_remains_an_outline() {
+        let conversion = convert(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 30 20">
+                <path d="M 2 5 L 12 5" transform="scale(2 1)" fill="none"
+                      stroke="black" stroke-width="2" stroke-linecap="round"/>
+            </svg>"#,
+        );
+
+        assert_eq!(conversion.line_elements, 0);
+        assert!(conversion.area_elements > 0);
+        assert!(
+            point_symbol(&conversion)
+                .elements
+                .iter()
+                .all(|element| matches!(element, Element::Area { .. }))
+        );
+    }
+
+    #[test]
+    fn unsupported_dash_offset_remains_an_outline() {
+        let conversion = convert(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 30 10">
+                <path d="M 1 5 H 29" fill="none" stroke="black" stroke-width="1"
+                      stroke-dasharray="4 2" stroke-dashoffset="1"/>
+            </svg>"#,
+        );
+
+        assert_eq!(conversion.line_elements, 0);
+        assert!(conversion.area_elements > 0);
+    }
+
+    #[test]
+    fn fill_and_compatible_stroke_can_share_one_color_layer() {
+        let conversion = convert(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+                <rect x="2" y="2" width="16" height="16" fill="#abcdef"
+                      stroke="#abcdef" stroke-width="1" stroke-linejoin="bevel"/>
+            </svg>"##,
+        );
+
+        assert_eq!(conversion.paint_layers, 1);
+        assert_eq!(conversion.line_elements, 1);
+        assert_eq!(conversion.area_elements, 1);
+        assert!(matches!(
+            point_symbol(&conversion).elements.as_slice(),
+            [Element::Area { .. }, Element::Line { .. }]
+        ));
+    }
+
+    #[test]
+    fn native_lines_survive_an_omap_round_trip() {
+        let conversion = convert(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+                <path d="M 2 10 C 5 2 15 18 18 10" fill="none" stroke="#654321"
+                      stroke-width="1.5" stroke-linecap="round" stroke-linejoin="bevel"/>
+            </svg>"##,
+        );
+        let mut bytes = Vec::new();
+        conversion
+            .map
+            .to_writer(&mut bytes)
+            .expect("converted map should serialize");
+        let parsed = Omap::from_bytes(bytes).expect("serialized map should parse");
+        let parsed_point = parsed
+            .symbols
+            .iter_point_symbols()
+            .next()
+            .expect("round trip should retain the point symbol")
+            .1;
+
+        assert!(matches!(
+            parsed_point.elements.as_slice(),
+            [Element::Line { .. }]
+        ));
     }
 }
