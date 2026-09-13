@@ -1,0 +1,142 @@
+name: Build binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.package }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            package: svg2omap-linux-x86_64
+            windows: false
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            package: svg2omap-linux-arm64
+            windows: false
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            package: svg2omap-windows-x86_64
+            windows: true
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            package: svg2omap-windows-arm64
+            windows: true
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            package: svg2omap-macos-x86_64
+            windows: false
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            package: svg2omap-macos-arm64
+            windows: false
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install current stable Rust
+        shell: bash
+        run: |
+          rustup set profile minimal
+          rustup update stable --no-self-update
+          rustup target add "${{ matrix.target }}"
+
+      - name: Test
+        run: cargo test --locked --all-targets --target ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Package Unix binary
+        if: ${{ !matrix.windows }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="${{ matrix.package }}"
+          mkdir -p "dist/$package"
+          cp "target/${{ matrix.target }}/release/svg2omap" "dist/$package/"
+          cp README.md "dist/$package/"
+          tar -C dist -czf "dist/$package.tar.gz" "$package"
+
+      - name: Package Windows binary
+        if: ${{ matrix.windows }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $package = "${{ matrix.package }}"
+          $packageDirectory = Join-Path "dist" $package
+          New-Item -ItemType Directory -Force -Path $packageDirectory | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/svg2omap.exe" $packageDirectory
+          Copy-Item "README.md" $packageDirectory
+          $archive = Join-Path "dist" "$package.zip"
+          Compress-Archive -Path "$packageDirectory/*" -DestinationPath $archive
+
+      - name: Upload binary archive
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.package }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download binary archives
+        uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create or update release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mapfile -d '' assets < <(
+            find dist -type f \( \
+              -name '*.tar.gz' -o \
+              -name '*.zip' \
+            \) -print0
+          )
+          if (( ${#assets[@]} == 0 )); then
+            echo "No release assets were downloaded" >&2
+            exit 1
+          fi
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
+          else
+            gh release create "$RELEASE_TAG" "${assets[@]}" \
+              --verify-tag \
+              --generate-notes
+          fi
